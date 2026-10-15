@@ -1,0 +1,33 @@
+
+acesso
+https://dashboard.questor.com.br/cs/cancelamentos-matriz
+cristian.andrioli@questores.com.br
+Cry0369*!@#
+
+
+acesso ao desk-questor
+cristian.andrioli@questores.com.br
+Cris987.+-*/002
+
+
+acesso ao qdesk
+cristian.andrioli@questores.com.br
+Cry0369*!@#
+
+
+https://suporte.questor.com.br
+https://developers.chatwoot.com/api-reference/introduction
+xTqLDAgJi4QnosKkjSM7BzMp
+
+
+
+
+
+Data Lake
+Postgres
+Host: datalake-db.questor.local
+Porta: 5432
+usuario: consulta
+senha: Qu3st0r2023
+Banco: datalakequestor
+Schema: public

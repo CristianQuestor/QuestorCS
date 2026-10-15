@@ -1,0 +1,257 @@
+"""Servidor do painel CS Questor, independente do QA Hub.
+
+Por que existir: o painel morava dentro do QA Hub (porta 8000), como template
+Jinja envolvido em {% raw %}. Isso obrigava a copiar um arquivo de 2 MB para
+outro projeto a cada geracao, e amarrava a publicacao ao ciclo de vida daquele
+app. Aqui o painel e servido do proprio arquivo que painel.py gera, sem copia e
+sem Jinja, entao o envoltorio raw deixou de ser necessario.
+
+A pagina traz nome de cliente, CNPJ, MRR e o texto literal dos chamados. Por
+isso duas travas:
+
+  1. Escuta em 127.0.0.1 por padrao. Abrir na rede exige --host 0.0.0.0, que e
+     uma decisao consciente e nao um acidente de configuracao.
+
+  2. Exige login. A senha nunca e gravada: o que fica no disco e um hash
+     pbkdf2, e o arquivo com ele esta no .gitignore.
+
+    python servidor.py
+    python servidor.py --host 0.0.0.0 --porta 8050
+    python servidor.py --definir-usuario admin        (pede a senha e sai)
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import secrets
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from flask import (Flask, Response, abort, jsonify, redirect, render_template_string,
+                   request, session)
+from werkzeug.security import check_password_hash, generate_password_hash
+
+RAIZ = Path(__file__).resolve().parent
+PAGINA = RAIZ / "dashboard" / "index.html"
+ACESSO = RAIZ / "dados" / "acesso.json"
+
+HOST_PADRAO = os.environ.get("PAINEL_HOST", "127.0.0.1")
+PORTA_PADRAO = int(os.environ.get("PAINEL_PORTA", "8050"))
+
+SESSAO_HORAS = 12
+LIVRES = {"/login", "/saude"}
+
+# Freio de forca bruta. Nao e rate limit de verdade, e proposital: guardar
+# estado em memoria basta para uma porta de rede interna, e nao adiciona
+# dependencia nenhuma. Reinicio zera, o que e aceitavel aqui.
+TENTATIVAS_ATE_ESPERAR = 5
+ESPERA_SEGUNDOS = 60
+_falhas: dict[str, list[float]] = defaultdict(list)
+
+app = Flask(__name__)
+
+
+# --------------------------------------------------------------------- acesso
+def _carregar_acesso() -> dict:
+    if ACESSO.exists():
+        return json.loads(ACESSO.read_text(encoding="utf-8"))
+    return {"segredo": "", "usuarios": {}}
+
+
+def _gravar_acesso(dados: dict) -> None:
+    ACESSO.parent.mkdir(parents=True, exist_ok=True)
+    ACESSO.write_text(json.dumps(dados, indent=1), encoding="utf-8")
+
+
+def definir_usuario(nome: str, senha: str) -> None:
+    """Cria ou troca a senha de um usuario. So o hash vai para o disco."""
+    dados = _carregar_acesso()
+    if not dados.get("segredo"):
+        # segredo persistido: sem isso toda reinicializacao derruba as sessoes
+        dados["segredo"] = secrets.token_hex(32)
+    dados.setdefault("usuarios", {})[nome] = generate_password_hash(senha)
+    _gravar_acesso(dados)
+
+
+def _conferir(nome: str, senha: str) -> bool:
+    guardado = _carregar_acesso().get("usuarios", {}).get(nome)
+    if not guardado:
+        # compara mesmo assim, para o tempo de resposta nao denunciar se o
+        # usuario existe
+        check_password_hash(generate_password_hash("x"), senha)
+        return False
+    return check_password_hash(guardado, senha)
+
+
+def _bloqueado(ip: str) -> int:
+    agora = time.time()
+    _falhas[ip] = [t for t in _falhas[ip] if agora - t < ESPERA_SEGUNDOS]
+    if len(_falhas[ip]) < TENTATIVAS_ATE_ESPERAR:
+        return 0
+    return int(ESPERA_SEGUNDOS - (agora - _falhas[ip][0])) + 1
+
+
+# ---------------------------------------------------------------------- telas
+LOGIN = """<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CS Questor</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--acento:#ED5F2C;--barra:#1B1B1D;--fundo:#FFFFFF;--sup:#FCFCFC;
+  --tinta:#18181B;--tinta2:#57564F;--tinta3:#8C8A83;--borda:#E7E6E2;--grave:#B4211C}
+@media (prefers-color-scheme:dark){:root{--fundo:#0F0F11;--sup:#161618;
+  --tinta:#FAFAF9;--tinta2:#A8A6A0;--tinta3:#76746E;--borda:#292927;--grave:#F08A85}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--fundo);
+  color:var(--tinta);font:14px/1.55 Inter,system-ui,-apple-system,"Segoe UI",sans-serif;
+  padding:24px}
+form{width:100%;max-width:340px;background:var(--sup);border:1px solid var(--borda);
+  border-radius:14px;padding:26px 24px}
+.marca{display:flex;align-items:center;gap:9px;font-weight:600;margin-bottom:4px}
+.sigla{width:26px;height:26px;border-radius:6px;display:grid;place-items:center;
+  background:var(--acento);color:#fff;font-size:13px;font-weight:700}
+p.sub{margin:0 0 20px;color:var(--tinta3);font-size:12.5px}
+label{display:block;font-size:10.5px;font-weight:700;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--tinta3);margin:0 0 5px}
+input{width:100%;padding:9px 11px;border:1px solid var(--borda);border-radius:9px;
+  background:var(--fundo);color:var(--tinta);font:14px/1.5 inherit;margin-bottom:14px}
+input:focus{outline:2px solid var(--acento);outline-offset:1px}
+button{width:100%;padding:10px;border:0;border-radius:9px;background:var(--acento);
+  color:#fff;font:600 14px/1.4 inherit;cursor:pointer}
+button:hover{filter:brightness(1.06)}
+.erro{margin:0 0 14px;padding:9px 11px;border-radius:9px;font-size:12.5px;
+  border:1px solid var(--grave);color:var(--grave)}
+</style></head><body>
+<form method="post" action="/login">
+  <div class="marca"><span class="sigla">Q</span> CS Questor</div>
+  <p class="sub">Cancelamentos e atendimentos</p>
+  {% if erro %}<p class="erro">{{ erro }}</p>{% endif %}
+  <label for="usuario">Usuário</label>
+  <input id="usuario" name="usuario" autocomplete="username" autofocus required>
+  <label for="senha">Senha</label>
+  <input id="senha" name="senha" type="password" autocomplete="current-password" required>
+  <button type="submit">Entrar</button>
+</form></body></html>"""
+
+
+@app.before_request
+def _exigir_login():
+    if request.path in LIVRES or request.path.startswith("/static/"):
+        return
+    if not session.get("usuario"):
+        return redirect("/login")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        if session.get("usuario"):
+            return redirect("/")
+        return render_template_string(LOGIN, erro=None)
+
+    ip = request.remote_addr or "?"
+    espera = _bloqueado(ip)
+    if espera:
+        return render_template_string(
+            LOGIN, erro=f"Muitas tentativas. Tente de novo em {espera}s."), 429
+
+    nome = (request.form.get("usuario") or "").strip()
+    if _conferir(nome, request.form.get("senha") or ""):
+        _falhas.pop(ip, None)
+        session.permanent = True
+        session["usuario"] = nome
+        return redirect("/")
+    _falhas[ip].append(time.time())
+    return render_template_string(LOGIN, erro="Usuário ou senha não conferem."), 401
+
+
+@app.route("/sair")
+def sair():
+    session.clear()
+    return redirect("/login")
+
+
+# ---------------------------------------------------------------------- painel
+def _sem_cache(resposta: Response) -> Response:
+    """O painel e regerado por fora; cache do navegador esconderia a versao nova.
+
+    Ja custou tempo uma vez: a pagina nao mudava depois de regerada porque o
+    Flask servia do cache de template. Aqui nao ha template, mas o navegador
+    faria o mesmo estrago sozinho.
+    """
+    resposta.headers["Cache-Control"] = "no-store, must-revalidate"
+    resposta.headers["Pragma"] = "no-cache"
+    return resposta
+
+
+@app.route("/")
+def painel() -> Response:
+    if not PAGINA.exists():
+        abort(503, "dashboard/index.html nao existe. Rode: python src/painel.py")
+    return _sem_cache(Response(PAGINA.read_bytes(), mimetype="text/html; charset=utf-8"))
+
+
+@app.route("/usabilidade-produto")
+def compatibilidade() -> Response:
+    """Endereco antigo, herdado do QA Hub. Redireciona para a raiz."""
+    return redirect("/", code=302)
+
+
+@app.route("/saude")
+def saude() -> Response:
+    """Fica sem login de proposito: e so um sinal de vida, sem dado de cliente."""
+    if not PAGINA.exists():
+        return jsonify({"ok": False, "erro": "pagina nao gerada"}), 503
+    info = PAGINA.stat()
+    gerado = datetime.fromtimestamp(info.st_mtime, tz=timezone.utc).astimezone()
+    return jsonify({"ok": True, "kb": round(info.st_size / 1024),
+                    "gerado_em": gerado.isoformat(timespec="seconds")})
+
+
+# ------------------------------------------------------------------- execucao
+def main() -> None:
+    ler = argparse.ArgumentParser(description="Serve o painel CS Questor.")
+    ler.add_argument("--porta", type=int, default=PORTA_PADRAO)
+    ler.add_argument("--host", default=HOST_PADRAO)
+    ler.add_argument("--definir-usuario", metavar="NOME",
+                     help="cria ou troca a senha de um usuario e sai")
+    args = ler.parse_args()
+
+    if args.definir_usuario:
+        senha = getpass.getpass(f"senha para {args.definir_usuario}: ")
+        if not senha:
+            sys.exit("senha vazia, nada foi gravado")
+        if senha != getpass.getpass("repita: "):
+            sys.exit("as senhas nao conferem, nada foi gravado")
+        definir_usuario(args.definir_usuario, senha)
+        print(f"usuario {args.definir_usuario} gravado em {ACESSO}")
+        return
+
+    dados = _carregar_acesso()
+    if not dados.get("usuarios"):
+        sys.exit("nenhum usuario cadastrado.\n"
+                 "  crie um com: python servidor.py --definir-usuario admin")
+    app.secret_key = dados["segredo"]
+    app.permanent_session_lifetime = timedelta(hours=SESSAO_HORAS)
+    app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+
+    if not PAGINA.exists():
+        print("AVISO: dashboard/index.html ainda nao existe.")
+        print("       Gere com: python src/painel.py")
+
+    aberto = args.host not in ("127.0.0.1", "localhost")
+    print(f"painel CS Questor em http://{args.host if aberto else 'localhost'}:{args.porta}/")
+    print(f"  {len(dados['usuarios'])} usuario(s) cadastrado(s), sessao de {SESSAO_HORAS}h")
+    if aberto:
+        print("  escutando na rede. A pagina tem dado real de cliente atras do login.")
+    app.run(host=args.host, port=args.porta, debug=False, use_reloader=False)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+.env
+dados/cache/
+__pycache__/
+*.pyc
+
+# credenciais e artefatos locais
+dados.md.txt
+desk-questor-mcp/.env
+desk-questor-mcp/.venv/
+desk-questor-mcp/cache/
+design/.chrome/
+dashboard/index.html
+dados/acesso.json
